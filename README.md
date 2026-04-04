@@ -2,7 +2,9 @@
 
 Statistical traffic forecasting for SEO using Meta's Prophet. Connects to Claude Desktop as an MCP server.
 
-I tested Claude, ARIMA, and Prophet against 486 days of real GSC data. All 3 landed within 10% of each other on the headline number, but Prophet delivered the tightest confidence bands (34% narrower than ARIMA) and quantified weekly seasonality that neither of the others could match. Full writeup with results: **[I Tested 3 Ways to Forecast SEO Traffic](https://suganthan.com/blog/forecast-seo-traffic-prophet-claude-code/)**
+I tested Claude, ARIMA, and Prophet against 486 days of real GSC data. All 3 landed within 10% of each other on the headline number, but Prophet delivered the tightest confidence bands (34% narrower than ARIMA) and quantified weekly seasonality that neither of the others could match. 
+
+Full writeup with results: **[I Tested 3 Ways to Forecast SEO Traffic](https://suganthan.com/blog/forecast-seo-traffic-prophet-claude-code/)**
 
 ![Prophet forecast with confidence bands and weekly seasonality](screenshots/forecast-chart.png)
 
