@@ -6,6 +6,12 @@ Runs Meta's Prophet locally to forecast clicks, impressions, or any time
 series metric. Designed to work alongside GSC MCP or BigQuery MCP servers
 in Claude Desktop.
 
+Features:
+    - Trend detection with confidence intervals
+    - Weekly seasonality breakdown
+    - Event annotations (algo updates, migrations, launches) that improve accuracy
+    - Interactive Plotly charts with forecast visualisation
+
 Usage:
     python3 server.py
 
@@ -36,56 +42,63 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "Prophet Forecast",
-    instructions="Statistical traffic forecasting using Meta's Prophet. Runs locally, no cloud services, no API costs.",
+    instructions="Statistical traffic forecasting using Meta's Prophet. Runs locally, no cloud services, no API costs. Supports event annotations and interactive charts.",
 )
 
 
-@mcp.tool()
-def forecast_traffic(
+def _build_holidays_df(events: list[dict] | None):
+    """Convert event annotations into a Prophet holidays DataFrame."""
+    if not events:
+        return None
+
+    try:
+        import pandas as pd
+    except ImportError:
+        return None
+
+    rows = []
+    for event in events:
+        date = event.get("date")
+        label = event.get("label", "event")
+        # window_before and window_after let the event affect surrounding days
+        lower = event.get("window_before", 1)
+        upper = event.get("window_after", 3)
+        rows.append({
+            "holiday": label,
+            "ds": pd.to_datetime(date),
+            "lower_window": -abs(int(lower)),
+            "upper_window": abs(int(upper)),
+        })
+
+    return pd.DataFrame(rows) if rows else None
+
+
+def _run_forecast(
     dates: list[str],
     values: list[float],
     horizon: int = 30,
     metric: str = "clicks",
-) -> str:
-    """
-    Forecast future traffic using Meta's Prophet statistical model.
-
-    Takes historical date/value pairs (e.g. daily clicks from GSC) and
-    returns a forecast with trend analysis, confidence intervals, and
-    weekly seasonality patterns.
-
-    This is NOT an LLM doing the math. Prophet is a proper statistical
-    forecasting library that produces reliable, reproducible results
-    with confidence intervals.
-
-    Args:
-        dates: List of dates in YYYY-MM-DD format, e.g. ["2026-01-01", "2026-01-02", ...]
-        values: List of numeric values corresponding to each date, e.g. [150, 163, ...]
-        horizon: Number of days to forecast into the future (default 30, max 365)
-        metric: Name of the metric being forecast, e.g. "clicks" or "impressions" (for labelling only)
-
-    Returns:
-        JSON string with trend analysis, daily forecast with confidence intervals,
-        and weekly seasonality breakdown.
-    """
+    events: list[dict] | None = None,
+) -> dict:
+    """Core forecasting logic shared by all tools. Returns a dict."""
     try:
         import pandas as pd
         from prophet import Prophet
     except ImportError:
-        return json.dumps({
+        return {
             "error": "Prophet is not installed. Run: pip3 install prophet",
             "fix": "Open your terminal and run: pip3 install prophet"
-        })
+        }
 
     if len(dates) != len(values):
-        return json.dumps({
+        return {
             "error": f"Mismatched data: {len(dates)} dates but {len(values)} values. These must be the same length."
-        })
+        }
 
     if len(dates) < 14:
-        return json.dumps({
+        return {
             "error": f"Need at least 14 data points for a reliable forecast. Got {len(dates)}. Try pulling more historical data."
-        })
+        }
 
     # Cap horizon
     horizon = min(max(horizon, 7), 365)
@@ -94,12 +107,16 @@ def forecast_traffic(
     df = pd.DataFrame({"ds": pd.to_datetime(dates), "y": values})
     df = df.dropna(subset=["y"]).sort_values("ds").reset_index(drop=True)
 
+    # Build holidays/events dataframe
+    holidays_df = _build_holidays_df(events)
+
     # Fit Prophet
     m = Prophet(
         yearly_seasonality=len(df) >= 365,
         weekly_seasonality=True,
         daily_seasonality=False,
         interval_width=0.95,
+        holidays=holidays_df,
     )
     m.fit(df)
 
@@ -140,7 +157,33 @@ def forecast_traffic(
     best_day = max(weekday_effects, key=weekday_effects.get) if weekday_effects else "unknown"
     worst_day = min(weekday_effects, key=weekday_effects.get) if weekday_effects else "unknown"
 
-    # Build forecast table (weekly summary for readability)
+    # Event impact analysis
+    event_impact = {}
+    if holidays_df is not None and not holidays_df.empty:
+        for _, event_row in holidays_df.iterrows():
+            label = event_row["holiday"]
+            event_date = event_row["ds"]
+            # Find the holiday effect columns Prophet creates
+            col_name = f"{label}"
+            # Prophet creates columns like 'event_name' for each holiday
+            matching_cols = [c for c in forecast.columns if c == label]
+            if matching_cols:
+                col = matching_cols[0]
+                effect = forecast[col].mean()
+                # Also get the effect around the event date
+                nearby = forecast[
+                    (forecast["ds"] >= event_date + pd.Timedelta(days=event_row["lower_window"])) &
+                    (forecast["ds"] <= event_date + pd.Timedelta(days=event_row["upper_window"]))
+                ]
+                if len(nearby) > 0:
+                    peak_effect = nearby[col].abs().max()
+                    event_impact[label] = {
+                        "date": event_date.strftime("%Y-%m-%d"),
+                        "estimated_daily_impact": round(peak_effect, 1),
+                        "direction": "positive" if nearby[col].mean() > 0 else "negative",
+                    }
+
+    # Build forecast table
     daily_forecast = [
         {
             "date": row["ds"].strftime("%Y-%m-%d"),
@@ -187,11 +230,65 @@ def forecast_traffic(
             "yearly_seasonality": len(df) >= 365,
             "weekly_seasonality": True,
             "confidence_interval": "95%",
+            "events_included": len(events) if events else 0,
             "note": "This forecast was generated by Meta's Prophet statistical model running locally on your machine. No data was sent to any cloud service.",
+        },
+        # Store raw data for chart generation
+        "_chart_data": {
+            "historical": df.to_dict(orient="records"),
+            "forecast": forecast.to_dict(orient="records"),
+            "events": events,
+            "metric": metric,
         },
     }
 
-    return json.dumps(result, indent=2)
+    if event_impact:
+        result["event_impact"] = event_impact
+
+    return result
+
+
+@mcp.tool()
+def forecast_traffic(
+    dates: list[str],
+    values: list[float],
+    horizon: int = 30,
+    metric: str = "clicks",
+    events: list[dict] | None = None,
+) -> str:
+    """
+    Forecast future traffic using Meta's Prophet statistical model.
+
+    Takes historical date/value pairs (e.g. daily clicks from GSC) and
+    returns a forecast with trend analysis, confidence intervals, and
+    weekly seasonality patterns.
+
+    This is NOT an LLM doing the math. Prophet is a proper statistical
+    forecasting library that produces reliable, reproducible results
+    with confidence intervals.
+
+    Args:
+        dates: List of dates in YYYY-MM-DD format, e.g. ["2026-01-01", "2026-01-02", ...]
+        values: List of numeric values corresponding to each date, e.g. [150, 163, ...]
+        horizon: Number of days to forecast into the future (default 30, max 365)
+        metric: Name of the metric being forecast, e.g. "clicks" or "impressions" (for labelling only)
+        events: Optional list of event annotations that may have affected traffic.
+                Each event is a dict with:
+                    - "date": YYYY-MM-DD (required)
+                    - "label": short description like "core update" or "site migration" (required)
+                    - "window_before": days before the event it may have had impact (default 1)
+                    - "window_after": days after the event it may have had impact (default 3)
+                Example: [{"date": "2026-01-15", "label": "core update", "window_after": 7}]
+                Prophet uses these as special events to improve forecast accuracy.
+
+    Returns:
+        JSON string with trend analysis, daily forecast with confidence intervals,
+        weekly seasonality breakdown, and event impact analysis if events were provided.
+    """
+    result = _run_forecast(dates, values, horizon, metric, events)
+    # Remove internal chart data from the JSON output
+    result.pop("_chart_data", None)
+    return json.dumps(result, indent=2, default=str)
 
 
 @mcp.tool()
@@ -199,6 +296,8 @@ def forecast_from_csv(
     file_path: str,
     horizon: int = 30,
     metric: str = "clicks",
+    events: list[dict] | None = None,
+    events_csv: str | None = None,
 ) -> str:
     """
     Forecast traffic from a CSV file using Meta's Prophet.
@@ -211,6 +310,14 @@ def forecast_from_csv(
         file_path: Absolute path to a CSV file with date and value columns
         horizon: Number of days to forecast (default 30, max 365)
         metric: Name of the metric, e.g. "clicks" or "impressions" (for labelling)
+        events: Optional list of event annotations (same format as forecast_traffic)
+        events_csv: Optional path to a CSV file with event annotations.
+                    Must have columns: date (YYYY-MM-DD), label (text).
+                    Optional columns: window_before (int), window_after (int).
+                    Example rows:
+                        date,label,window_after
+                        2026-01-15,core update,7
+                        2026-02-01,site migration,14
 
     Returns:
         JSON string with trend analysis, forecast, and weekly seasonality.
@@ -251,7 +358,243 @@ def forecast_from_csv(
         dates = df[date_col].tolist()
         values = df[value_col].tolist()
 
-    return forecast_traffic(dates=dates, values=values, horizon=horizon, metric=metric)
+    # Load events from CSV if provided
+    if events_csv and os.path.exists(events_csv):
+        events_df = pd.read_csv(events_csv)
+        loaded_events = []
+        for _, row in events_df.iterrows():
+            event = {
+                "date": str(row.get("date", "")),
+                "label": str(row.get("label", "event")),
+            }
+            if "window_before" in events_df.columns:
+                event["window_before"] = int(row.get("window_before", 1))
+            if "window_after" in events_df.columns:
+                event["window_after"] = int(row.get("window_after", 3))
+            loaded_events.append(event)
+        # Merge with any directly provided events
+        if events:
+            events = events + loaded_events
+        else:
+            events = loaded_events
+
+    result = _run_forecast(dates=dates, values=values, horizon=horizon, metric=metric, events=events)
+    result.pop("_chart_data", None)
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def forecast_chart(
+    dates: list[str],
+    values: list[float],
+    horizon: int = 30,
+    metric: str = "clicks",
+    events: list[dict] | None = None,
+    output_path: str | None = None,
+) -> str:
+    """
+    Generate an interactive Plotly chart of the Prophet forecast.
+
+    Creates an HTML file with:
+    - Historical data as a scatter plot
+    - Forecast line with 95% confidence band (shaded)
+    - Event annotations as vertical markers with labels
+    - Hover tooltips showing exact values and dates
+    - Zoomable, pannable, downloadable as PNG
+
+    The chart opens automatically in the default browser.
+
+    Args:
+        dates: List of dates in YYYY-MM-DD format
+        values: List of numeric values corresponding to each date
+        horizon: Number of days to forecast (default 30, max 365)
+        metric: Name of the metric, e.g. "clicks" or "impressions"
+        events: Optional list of event annotations (same format as forecast_traffic)
+        output_path: Optional path to save the HTML chart. Defaults to ~/Desktop/prophet_forecast.html
+
+    Returns:
+        JSON string with the chart file path and a summary of the forecast.
+    """
+    try:
+        import plotly.graph_objects as go
+        import pandas as pd
+    except ImportError:
+        return json.dumps({
+            "error": "Plotly is not installed. Run: pip3 install plotly",
+            "fix": "Open your terminal and run: pip3 install plotly"
+        })
+
+    # Run the forecast
+    result = _run_forecast(dates, values, horizon, metric, events)
+
+    if "error" in result:
+        return json.dumps(result)
+
+    chart_data = result.get("_chart_data", {})
+    historical_records = chart_data.get("historical", [])
+    forecast_records = chart_data.get("forecast", [])
+
+    hist_df = pd.DataFrame(historical_records)
+    hist_df["ds"] = pd.to_datetime(hist_df["ds"])
+
+    fc_df = pd.DataFrame(forecast_records)
+    fc_df["ds"] = pd.to_datetime(fc_df["ds"])
+
+    historical_end = hist_df["ds"].max()
+    future_df = fc_df[fc_df["ds"] > historical_end]
+
+    fig = go.Figure()
+
+    # Historical data points
+    fig.add_trace(go.Scatter(
+        x=hist_df["ds"],
+        y=hist_df["y"],
+        mode="markers",
+        name=f"Historical {metric}",
+        marker=dict(color="#527ED7", size=3, opacity=0.5),
+        hovertemplate="%{x|%a %d %b %Y}<br>" + metric.capitalize() + ": %{y:.0f}<extra></extra>",
+    ))
+
+    # Forecast line
+    fig.add_trace(go.Scatter(
+        x=future_df["ds"],
+        y=future_df["yhat"],
+        mode="lines",
+        name="Forecast",
+        line=dict(color="#1a1a1a", width=2),
+        hovertemplate="%{x|%a %d %b %Y}<br>Predicted: %{y:.0f}<extra></extra>",
+    ))
+
+    # Confidence band (upper)
+    fig.add_trace(go.Scatter(
+        x=future_df["ds"],
+        y=future_df["yhat_upper"],
+        mode="lines",
+        name="95% upper",
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    # Confidence band (lower, fills to upper)
+    fig.add_trace(go.Scatter(
+        x=future_df["ds"],
+        y=future_df["yhat_lower"],
+        mode="lines",
+        name="95% confidence",
+        line=dict(width=0),
+        fill="tonexty",
+        fillcolor="rgba(82, 126, 215, 0.15)",
+        hovertemplate="%{x|%a %d %b %Y}<br>Range: %{y:.0f} to " +
+                      future_df["yhat_upper"].apply(lambda x: f"{x:.0f}").tolist().__getitem__(0) +
+                      "<extra></extra>" if len(future_df) > 0 else "",
+    ))
+
+    # Trend line across full range
+    fig.add_trace(go.Scatter(
+        x=fc_df["ds"],
+        y=fc_df["trend"],
+        mode="lines",
+        name="Trend",
+        line=dict(color="#999", width=1, dash="dot"),
+        hovertemplate="%{x|%a %d %b %Y}<br>Trend: %{y:.0f}<extra></extra>",
+    ))
+
+    # Event annotations
+    if events:
+        for event in events:
+            event_date = pd.to_datetime(event["date"])
+            label = event.get("label", "event")
+
+            # Vertical line
+            fig.add_vline(
+                x=event_date,
+                line_width=1.5,
+                line_dash="dash",
+                line_color="#e74c3c",
+                opacity=0.7,
+            )
+
+            # Label
+            fig.add_annotation(
+                x=event_date,
+                y=1.05,
+                yref="paper",
+                text=label,
+                showarrow=False,
+                font=dict(size=10, color="#e74c3c"),
+                textangle=-30,
+            )
+
+    # Divider between historical and forecast
+    fig.add_vline(
+        x=historical_end,
+        line_width=1,
+        line_dash="dot",
+        line_color="#ccc",
+    )
+    fig.add_annotation(
+        x=historical_end,
+        y=0.02,
+        yref="paper",
+        text="forecast →",
+        showarrow=False,
+        font=dict(size=9, color="#999"),
+        xanchor="left",
+    )
+
+    # Layout
+    trend_info = result.get("trend", {})
+    title_text = (
+        f"{metric.capitalize()} Forecast: "
+        f"{trend_info.get('current_daily_avg', 0):.0f}/day → "
+        f"{trend_info.get('forecast_daily_avg', 0):.0f}/day "
+        f"({trend_info.get('direction', 'flat')} {abs(trend_info.get('change_percent', 0)):.1f}%)"
+    )
+
+    fig.update_layout(
+        title=dict(text=title_text, font=dict(size=16, color="#1a1a1a")),
+        xaxis_title="",
+        yaxis_title=metric.capitalize(),
+        template="plotly_white",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(t=80, b=60, l=60, r=30),
+        font=dict(family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
+    )
+
+    # Save the chart
+    if not output_path:
+        output_path = os.path.expanduser("~/Desktop/prophet_forecast.html")
+
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    fig.write_html(output_path, include_plotlyjs=True, full_html=True)
+
+    # Also try to open in browser
+    try:
+        import webbrowser
+        webbrowser.open(f"file://{os.path.abspath(output_path)}")
+    except Exception:
+        pass
+
+    # Return summary with file path
+    result.pop("_chart_data", None)
+    summary = {
+        "chart_saved": os.path.abspath(output_path),
+        "opened_in_browser": True,
+        "trend": result.get("trend", {}),
+        "weekly_seasonality": result.get("weekly_seasonality", {}),
+        "events_plotted": len(events) if events else 0,
+        "forecast_days": horizon,
+        "model_info": result.get("model_info", {}),
+    }
+
+    if "event_impact" in result:
+        summary["event_impact"] = result["event_impact"]
+
+    return json.dumps(summary, indent=2, default=str)
 
 
 if __name__ == "__main__":
