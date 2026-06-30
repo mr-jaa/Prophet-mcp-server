@@ -39,10 +39,16 @@ logging.getLogger("cmdstanpy").setLevel(logging.ERROR)
 logging.getLogger("prophet").setLevel(logging.ERROR)
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 mcp = FastMCP(
     "Prophet Forecast",
     instructions="Statistical traffic forecasting using Meta's Prophet. Runs locally, no cloud services, no API costs. Supports event annotations and interactive charts.",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["mcp.jaamedia.tech", "localhost", "localhost:8000"],
+        allowed_origins=["https://mcp.jaamedia.tech"],
+    ),
 )
 
 
